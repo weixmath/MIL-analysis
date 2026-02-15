@@ -1,0 +1,43 @@
+首先运行process_data.py
+
+stage1: CUDA_VISIBLE_DEVICES=0,5,6,7 torchrun --nproc_per_node=4 train_final.py --batch-size 256 --epochs 80 --group 4 --backbone convnext_tiny
+
+# ============== 标签随机置换实验 (Label Permutation Test) ==============
+# 这是一个验证实验，用于检测模型是否真正学到了有意义的信号
+# 如果模型在打乱标签后仍能学得很好，说明可能存在数据泄漏或伪相关
+# 如果性能掉到接近随机，说明当前 pipeline 的性能主要来自真实的可学习信号
+#
+# 使用方法：添加 --shuffle-labels 参数，其余参数保持与正常训练完全一致
+# 
+# 示例命令：
+stage1-shuffle: CUDA_VISIBLE_DEVICES=0,5,6,7 torchrun --nproc_per_node=3 train_final.py --batch-size 256 --epochs 80 --group 4 --backbone convnext_tiny --shuffle-labels --shuffle-seed 42
+#
+# --shuffle-seed 可以更换不同种子多次运行，验证结果稳定性
+# ======================================================================
+
+
+stage2: torchrun --nproc_per_node=8 train_final_stage2.py     --aggregator attentionmil     --group 4     --pretrained_backbone_path ./runs/group4_convnext_tiny_20250923-222753/best_model.pth     --batch-size 8     --lr 1e-4     --epochs 100     --patience 15     --weight-decay 0.01
+
+# ============== Stage 2 标签随机置换实验 ==============
+# 【重要】两阶段的 --shuffle-seed 必须保持一致！
+# 这样确保相同的 bag 在两阶段获得相同的打乱后标签
+#
+# Stage 2 置换实验命令：
+stage2-shuffle: 
+#CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 train_final_stage2.py     --aggregator attentionmil     --group 4     --pretrained_backbone_path ./runs/group4_convnext_tiny_SHUFFLED_seed42_20260209-215335/best_model.pth     --batch-size 8     --lr 1e-4     --epochs 100     --patience 15     --weight-decay 0.01     --shuffle-labels --shuffle-seed 42
+# 注意：pretrained_backbone_path 应该指向对应的 SHUFFLED 版本的 Stage 1 模型
+# ====================================================
+
+
+可视化:
+
+CUDA_VISIBLE_DEVICES=0 python visual_final.py \
+    --model_path /home/fyj/PtCO2/for_anbing/runs_stage2/stage2-v4fix-attentionmil_group4_convnext_tiny_SHUFFLED_seed42_20260209-231314/best_model_stage2.pth \
+    --data_dir ./patches_by_image/val \
+    --original_images_dir /data/wly/CuO-TEM-analysis-2026/data_CU/ \
+    --output_dir ./visual_results \
+    --group 4 \
+    --alpha 0.7 \
+    --top_k 20 \
+    --run_name my_nature_vis \
+    --exclude_classes 100
