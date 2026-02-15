@@ -1,0 +1,20 @@
+# Deep Learning Framework (PyTorch & Torchvision)
+# 注意：torchvision >= 0.13.0 是必须的，因为代码中使用了 weights='DEFAULT' 参数
+torch>=1.12.0
+torchvision>=0.13.0
+
+# Scientific Computing & Data Analysis
+numpy
+scipy
+scikit-learn
+
+# Visualization (Matplotlib & Seaborn for Nature-style plots)
+matplotlib
+seaborn
+
+# Image Processing
+Pillow
+opencv-python
+
+# Utilities (Progress bars, etc.)
+tqdm
