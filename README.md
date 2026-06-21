@@ -6,7 +6,7 @@ The pipeline features:
 1.  **Stage 1:** Self-supervised/Supervised backbone training on image patches.
 2.  **Stage 2:** MIL Aggregator training (AttentionMIL or TransMIL) using frozen backbones.
 3.  **Validation:** Integrated "Label Permutation Test" to detect data leakage.
-4.  **Visualization:** "Nature-journal" style plotting (ROC, Confusion Matrices) and Attention Heatmaps with Plasma overlay.
+4.  **Visualization:** Journal style plotting (ROC, Confusion Matrices) and Attention Heatmaps with Plasma overlay.
 
 ## 🛠️ Requirements
 
