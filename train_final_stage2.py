@@ -1063,6 +1063,8 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5, help='Initial learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.01, help='Weight decay (L2 regularization)')
     parser.add_argument('--patience', type=int, default=15, help='Patience for Early Stopping (in epochs)')
+    parser.add_argument('--enable-early-stopping', action='store_true',
+                        help='启用基于验证损失的早停；默认关闭，正式结果使用 final epoch checkpoint。')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate in Transformer (仅用于transmil)')
     parser.add_argument('--transformer-layers', type=int, default=2,
                         help='Number of layers in Transformer Encoder (仅用于transmil)')
@@ -1093,7 +1095,12 @@ def main():
     shuffle_tag = f"_SHUFFLED_seed{args.shuffle_seed}" if args.shuffle_labels else ""
     run_name = f"stage2-v4fix-{args.aggregator}_group{args.group}_{args.backbone}{shuffle_tag}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     output_dir = ensure_dir(os.path.join('runs_stage2', run_name))
+    # Official/reported checkpoint is the final epoch. Keep best_model_stage2.pth
+    # for backward compatibility with existing downstream scripts.
     best_model_path = os.path.join(output_dir, 'best_model_stage2.pth')
+    final_model_path = os.path.join(output_dir, 'final_model_stage2.pth')
+    best_val_model_path = os.path.join(output_dir, 'best_val_model_stage2.pth')
+    checkpoint_summary_path = os.path.join(output_dir, 'checkpoint_selection_summary_stage2.json')
 
     if rank == 0:
         class_to_idx_correct = {name: i for i, name in enumerate(classes_this_run)}
@@ -1103,6 +1110,7 @@ def main():
         print(f"分类组: {args.group}")
         print(f"使用的类别及其索引 (按字母顺序): {class_to_idx_correct}")
         print(f"Backbone: {args.backbone}")
+        print(f"Early stopping: {'enabled' if args.enable_early_stopping else 'disabled'}")
         print("-" * 50)
         
         if args.shuffle_labels:
@@ -1200,6 +1208,13 @@ def main():
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_val_acc_at_best_loss = 0.0
+    best_val_epoch = None
+    stopped_early = False
+    final_epoch = None
+    final_train_loss = None
+    final_train_acc = None
+    final_val_loss = None
+    final_val_acc = None
 
     if rank == 0:
         print("\n" + "=" * 20 + f" 开始 {args.aggregator.upper()} 训练 " + "=" * 20)
@@ -1215,28 +1230,36 @@ def main():
             print(
                 f"Epoch {epoch + 1}/{args.epochs} | LR: {current_lr:.1e} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
+            final_epoch = epoch + 1
+            final_train_loss = train_loss
+            final_train_acc = train_acc
+            final_val_loss = val_loss
+            final_val_acc = val_acc
+
             if val_loss < best_val_loss:
-                torch.save(model.module.state_dict(), best_model_path)
+                torch.save(model.module.state_dict(), best_val_model_path)
                 best_val_loss = val_loss
                 best_val_acc_at_best_loss = val_acc
+                best_val_epoch = epoch + 1
                 epochs_no_improve = 0
-                print(f"🎉 新的最佳验证损失: {best_val_loss:.4f} (Acc: {best_val_acc_at_best_loss:.4f})！模型已保存。")
+                print(f"🎉 新的最佳验证损失: {best_val_loss:.4f} (Acc: {best_val_acc_at_best_loss:.4f})！"
+                      f"诊断模型已保存到 {best_val_model_path}。")
             else:
                 epochs_no_improve += 1
-                print(f"验证损失未改善. 已持续 {epochs_no_improve}/{args.patience} epochs.")
+                if args.enable_early_stopping:
+                    print(f"验证损失未改善. 已持续 {epochs_no_improve}/{args.patience} epochs.")
+                else:
+                    print(f"验证损失未改善. 已持续 {epochs_no_improve} epochs（仅监控，不触发早停）。")
 
-            if epochs_no_improve >= args.patience:
+            if args.enable_early_stopping and epochs_no_improve >= args.patience:
                 print(f"\n验证损失已连续 {args.patience} epochs 未改善, 触发早停！")
-                # 在触发早停时，再进行一次同步，确保所有进程都将退出
-                dist.barrier()
-                break
 
-                # 无论是否早停，都需要一个 barrier 来同步所有进程
-        # 如果 rank 0 早停了，其他进程需要收到信号并一起退出
-        # 如果 rank 0 没有早停，其他进程也需要同步后才能进入下一轮
-        stop_signal = torch.tensor([1 if epochs_no_improve >= args.patience else 0], device=device)
+        # 只有显式启用 early stopping 时，rank 0 才会广播停止信号。
+        should_stop = args.enable_early_stopping and epochs_no_improve >= args.patience
+        stop_signal = torch.tensor([1 if should_stop else 0], device=device)
         dist.broadcast(stop_signal, src=0)
         if stop_signal.item() == 1:
+            stopped_early = True
             if rank != 0: print(f"Rank {rank} 收到早停信号, 准备退出...")
             break
 
@@ -1244,12 +1267,44 @@ def main():
     # 先同步所有进程
     dist.barrier()
     
-    # 加载最佳模型并生成可视化（仅在主进程进行）
+    # 加载最终轮正式模型并生成可视化（仅在主进程进行）
     if rank == 0:
+        torch.save(model.module.state_dict(), final_model_path)
+        torch.save(model.module.state_dict(), best_model_path)
+
+        checkpoint_summary = {
+            "reported_checkpoint": "final_epoch",
+            "validation_used_for_selection": False,
+            "validation_used_for_monitoring": True,
+            "early_stopping_enabled": args.enable_early_stopping,
+            "stopped_early": stopped_early,
+            "final_model_path": final_model_path,
+            "compatibility_model_path": best_model_path,
+            "best_val_model_path": best_val_model_path,
+            "final_epoch": final_epoch,
+            "best_val_epoch": best_val_epoch,
+            "final_train_loss": final_train_loss,
+            "final_train_acc": final_train_acc,
+            "final_val_loss": final_val_loss,
+            "final_val_acc": final_val_acc,
+            "best_val_loss": best_val_loss,
+            "best_val_acc": best_val_acc_at_best_loss,
+            "baseline_accuracy": baseline_acc,
+            "args": vars(args),
+        }
+        with open(checkpoint_summary_path, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint_summary, f, ensure_ascii=False, indent=2)
+
+        reported_acc = final_val_acc if final_val_acc is not None else 0.0
         print("\n" + "=" * 20 + " 训练结束 " + "=" * 20)
         print(f"多数投票基线准确率: {baseline_acc:.4f}")
-        print(f"最佳验证准确率 (在最低验证损失时): {best_val_acc_at_best_loss:.4f}")
-        improvement = best_val_acc_at_best_loss - baseline_acc
+        print(f"最终轮验证准确率: {reported_acc:.4f}")
+        print(f"验证损失最优时准确率 (诊断用): {best_val_acc_at_best_loss:.4f}")
+        print(f"Final epoch model saved at: {final_model_path}")
+        print(f"Compatibility checkpoint saved at: {best_model_path}")
+        print(f"Validation-best diagnostic checkpoint saved at: {best_val_model_path}")
+        print(f"Checkpoint selection summary saved at: {checkpoint_summary_path}")
+        improvement = reported_acc - baseline_acc
         print(f"性能提升: {improvement:+.4f}")
         
         # 如果是标签置换实验，给出结果解读
@@ -1258,13 +1313,13 @@ def main():
             print("\n" + "-" * 70)
             print("【Stage 2 标签随机置换实验结果分析】")
             print(f"随机基线 (Random Baseline): {random_baseline:.4f} ({num_classes}分类)")
-            print(f"最佳验证准确率: {best_val_acc_at_best_loss:.4f}")
-            
-            if best_val_acc_at_best_loss <= random_baseline + 0.10:  # 比随机高不超过10%
+            print(f"最终轮验证准确率: {reported_acc:.4f}")
+
+            if reported_acc <= random_baseline + 0.10:  # 比随机高不超过10%
                 print("\n✅ 结论：模型性能接近随机水平")
                 print("   这说明当前 MIL pipeline 的性能主要来自真实的可学习信号，")
                 print("   没有发现明显的数据泄漏或伪相关问题。")
-            elif best_val_acc_at_best_loss <= random_baseline + 0.25:  # 比随机高10%-25%
+            elif reported_acc <= random_baseline + 0.25:  # 比随机高10%-25%
                 print("\n⚠️  结论：模型性能略高于随机水平")
                 print("   建议进一步检查是否存在轻微的数据泄漏或训练/验证集的分布差异。")
             else:  # 比随机高超过25%
@@ -1281,9 +1336,9 @@ def main():
             else:
                 print("🤔 模型未能显著超越基线，建议继续调整超参数或检查数据。")
         
-        # 尝试加载最佳模型进行可视化
+        # 尝试加载最终轮正式模型进行可视化
         if os.path.exists(best_model_path):
-            print(f"\n正在加载最佳模型进行可视化: {best_model_path}")
+            print(f"\n正在加载最终轮正式模型进行可视化: {best_model_path}")
             
             # 创建新的模型实例（不使用DDP包装）
             if args.aggregator == 'transmil':
@@ -1295,7 +1350,7 @@ def main():
                 vis_model = AttentionMIL(num_classes=num_classes, backbone=args.backbone,
                                          pretrained_backbone_path=args.pretrained_backbone_path, rank=rank)
             
-            # 加载最佳权重
+            # 加载最终轮正式权重
             vis_model.load_state_dict(torch.load(best_model_path, map_location='cpu'))
             vis_model.to(device)
             vis_model.eval()
@@ -1329,7 +1384,7 @@ def main():
                 print(f"  • Baseline (MV):    {baseline_acc:.4f}")
                 print("=" * 50)
         else:
-            print(f"\n警告: 未找到最佳模型文件 {best_model_path}，跳过可视化。")
+            print(f"\n警告: 未找到最终轮模型文件 {best_model_path}，跳过可视化。")
     
     # 最后销毁进程组
     dist.destroy_process_group()

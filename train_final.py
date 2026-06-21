@@ -3,7 +3,7 @@
 # 训练脚本 - 支持标签随机置换实验 (Label Permutation Test)
 # 使用 --shuffle-labels 参数启用标签置换，验证模型是否学到真实信号
 # =====================================================================
-import os, argparse, datetime
+import os, argparse, datetime, json
 from typing import List, Dict, Tuple
 from PIL import Image
 from collections import defaultdict
@@ -334,7 +334,12 @@ def main():
     shuffle_tag = f"_SHUFFLED_seed{args.shuffle_seed}" if args.shuffle_labels else ""
     run_name = f"group{args.group}_{args.backbone}{shuffle_tag}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     output_dir = ensure_dir(os.path.join('runs', run_name))
+    # Official/reported checkpoint is the final epoch. Keep best_model.pth for
+    # backward compatibility with existing downstream scripts.
     best_model_path = os.path.join(output_dir, 'best_model.pth')
+    final_model_path = os.path.join(output_dir, 'final_model.pth')
+    best_val_model_path = os.path.join(output_dir, 'best_val_model.pth')
+    checkpoint_summary_path = os.path.join(output_dir, 'checkpoint_selection_summary.json')
 
     if rank == 0:
         print(f"Starting run: {run_name}")
@@ -423,13 +428,22 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scaler = torch.cuda.amp.GradScaler()
 
-    # <<< MODIFIED: 变量名从 best_val_acc 改为 best_agg_acc 以反映其新含义 >>>
-    best_agg_acc = 0.0
+    best_agg_acc = -1.0
+    best_agg_epoch = None
+    final_epoch = None
+    final_train_loss = None
+    final_train_acc = None
+    final_val_loss = None
+    final_val_patch_acc = None
+    final_agg_val_acc = None
+    final_per_class_acc = None
+
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, epoch, rank)
         val_loss, val_patch_acc, per_class_acc = validate(model, val_loader, criterion, device, rank, num_classes)
 
-        # --- <<< MODIFIED: 在主进程上执行聚合验证并保存最佳模型 >>> ---
+        # 在主进程上执行聚合验证。验证最优模型仅作为诊断保存，
+        # 不作为论文报告结果的模型选择依据。
         if rank == 0:
             # 1. 打印常规的 Patch 级别统计信息
             print(f"Epoch {epoch + 1}/{args.epochs} | Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | "
@@ -444,20 +458,59 @@ def main():
             agg_val_acc = validate_with_aggregation(model.module, val_ds, device)
             print(f" -> Aggregated Val Acc (Image Voting): {agg_val_acc:.4f}")
 
-            # 3. 根据聚合准确率保存最佳模型
+            final_epoch = epoch + 1
+            final_train_loss = train_loss
+            final_train_acc = train_acc
+            final_val_loss = val_loss
+            final_val_patch_acc = val_patch_acc
+            final_agg_val_acc = agg_val_acc
+            final_per_class_acc = per_class_acc
+
+            # 3. 保存验证最优模型作为监控/诊断文件，不覆盖正式 final checkpoint。
             if agg_val_acc > best_agg_acc:
                 best_agg_acc = agg_val_acc
-                torch.save(model.module.state_dict(), best_model_path)
-                print(f"** New best model saved to {best_model_path} with Aggregated Val Acc: {best_agg_acc:.4f} **\n")
+                best_agg_epoch = epoch + 1
+                torch.save(model.module.state_dict(), best_val_model_path)
+                print(f"** New validation-best diagnostic model saved to {best_val_model_path} "
+                      f"with Aggregated Val Acc: {best_agg_acc:.4f} **\n")
             else:
                 print("")  # 打印一个空行以分隔 epoch
 
     dist.barrier()
     if rank == 0:
+        torch.save(model.module.state_dict(), final_model_path)
+        torch.save(model.module.state_dict(), best_model_path)
+
+        checkpoint_summary = {
+            "reported_checkpoint": "final_epoch",
+            "validation_used_for_selection": False,
+            "validation_used_for_monitoring": True,
+            "final_model_path": final_model_path,
+            "compatibility_model_path": best_model_path,
+            "best_val_model_path": best_val_model_path,
+            "final_epoch": final_epoch,
+            "best_val_epoch": best_agg_epoch,
+            "final_train_loss": final_train_loss,
+            "final_train_acc": final_train_acc,
+            "final_val_loss": final_val_loss,
+            "final_val_patch_acc": final_val_patch_acc,
+            "final_aggregated_val_acc": final_agg_val_acc,
+            "best_aggregated_val_acc": best_agg_acc,
+            "final_per_class_val_acc": final_per_class_acc,
+            "args": vars(args),
+        }
+        with open(checkpoint_summary_path, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint_summary, f, ensure_ascii=False, indent=2)
+
+        reported_acc = final_agg_val_acc if final_agg_val_acc is not None else 0.0
         print("=" * 70)
         print("Training finished.")
-        print(f"Best model saved at: {best_model_path}")
-        print(f"Achieved best aggregated validation accuracy (voting): {best_agg_acc:.4f}")
+        print(f"Final epoch model saved at: {final_model_path}")
+        print(f"Compatibility checkpoint saved at: {best_model_path}")
+        print(f"Validation-best diagnostic checkpoint saved at: {best_val_model_path}")
+        print(f"Checkpoint selection summary saved at: {checkpoint_summary_path}")
+        print(f"Reported final-epoch aggregated validation accuracy (voting): {reported_acc:.4f}")
+        print(f"Best monitored aggregated validation accuracy (diagnostic only): {best_agg_acc:.4f}")
         
         # 如果是标签置换实验，给出结果解读
         if args.shuffle_labels:
@@ -465,13 +518,13 @@ def main():
             print("\n" + "-" * 70)
             print("【标签随机置换实验结果分析】")
             print(f"随机基线 (Random Baseline): {random_baseline:.4f} ({num_classes}分类)")
-            print(f"最佳验证准确率: {best_agg_acc:.4f}")
+            print(f"最终轮聚合验证准确率: {reported_acc:.4f}")
             
-            if best_agg_acc <= random_baseline + 0.10:  # 比随机高不超过10%
+            if reported_acc <= random_baseline + 0.10:  # 比随机高不超过10%
                 print("\n✅ 结论：模型性能接近随机水平")
                 print("   这说明当前 pipeline 的性能主要来自真实的可学习信号，")
                 print("   没有发现明显的数据泄漏或伪相关问题。")
-            elif best_agg_acc <= random_baseline + 0.25:  # 比随机高10%-25%
+            elif reported_acc <= random_baseline + 0.25:  # 比随机高10%-25%
                 print("\n⚠️  结论：模型性能略高于随机水平")
                 print("   建议进一步检查是否存在轻微的数据泄漏或训练/验证集的分布差异。")
             else:  # 比随机高超过25%
